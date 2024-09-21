@@ -22,7 +22,7 @@
     "client",
     "server"
   ],
-  "author": "wraithdeveloper",
+  "author": "wraith4081",
   "license": "MIT",
   "description": "A robust Network Time Protocol (NTP) client implementation for Node.js applications.",
   "devDependencies": {
