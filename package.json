@@ -11,7 +11,7 @@
     "build": "tsup src/index.ts --format cjs, esm --dts",
     "lint": "tsc",
     "test": "jest",
-    "release": "pnpm run build && pnpm run test && changeset publish"
+    "release": "pnpm run build && pnpm run test && changeset publish -r --access public && changeset tag"
   },
   "keywords": [
     "ntp",
