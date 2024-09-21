@@ -44,7 +44,7 @@ class NTPClient extends EventEmitter {
   private localClockOffset: number = 0;
   private interval: NodeJS.Timeout | null = null;
   private retryCount: number = 0;
-  private readonly maxRetries: number;
+  public readonly maxRetries: number;
   private syncStatus: SyncStatus = 'syncing';
 
   constructor(options: NTPClientOptions = {}) {
@@ -135,16 +135,27 @@ class NTPClient extends EventEmitter {
 
   private processNTPPacket(msg: Buffer): void {
     const receiveTimestamp = Date.now();
-    const originateTimestamp = msg.readUInt32BE(24) - SEVENTY_YEARS_IN_SECONDS;
-    const receiveServerTimestamp = msg.readUInt32BE(32) - SEVENTY_YEARS_IN_SECONDS;
-    const transmitServerTimestamp = msg.readUInt32BE(40) - SEVENTY_YEARS_IN_SECONDS;
 
-    this.roundTripDelay = (receiveTimestamp - this.lastSyncTime) - (transmitServerTimestamp - receiveServerTimestamp);
-    this.localClockOffset = ((receiveServerTimestamp - originateTimestamp) + (transmitServerTimestamp - receiveTimestamp)) / 2;
+    const originateTimestamp = NTPClient.ntpToMilliseconds(msg.readUInt32BE(24), msg.readUInt32BE(28));
+    const receiveServerTimestamp = NTPClient.ntpToMilliseconds(msg.readUInt32BE(32), msg.readUInt32BE(36));
+    const transmitServerTimestamp = NTPClient.ntpToMilliseconds(msg.readUInt32BE(40), msg.readUInt32BE(44));
 
-    this.syncedTime = receiveTimestamp + this.localClockOffset + this.timeOffset;
-    this.setSyncStatus(NTP_EVENTS.SYNCED);
+    const T1 = originateTimestamp;
+    const T2 = receiveServerTimestamp;
+    const T3 = transmitServerTimestamp;
+    const T4 = receiveTimestamp;
+
+    this.roundTripDelay = (T4 - T1) - (T3 - T2);
+    this.localClockOffset = ((T2 - T1) + (T3 - T4)) / 2;
+
+    this.syncedTime = receiveTimestamp + this.localClockOffset;
+    this.lastSyncTime = receiveTimestamp;
+    this.setSyncStatus('synced');
     this.emit(NTP_EVENTS.SYNC, this.getTime());
+  }
+
+  public static ntpToMilliseconds(seconds: number, fraction: number): number {
+    return (seconds - SEVENTY_YEARS_IN_SECONDS) * 1000 + (fraction * 1000 / 0x100000000);
   }
 
   public getTime(): number {
