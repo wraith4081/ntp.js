@@ -1,6 +1,9 @@
 {
   "name": "ntp.js",
   "version": "1.0.0",
+  "engines": {
+    "node": ">=16.0.0"
+  },
   "main": "dist/index.js",
   "module": "dist/index.mjs",
   "types": "dist/index.d.ts",
@@ -8,10 +11,18 @@
     "build": "tsup src/index.ts --format cjs, esm --dts",
     "lint": "tsc"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "description": "",
+  "keywords": [
+    "ntp",
+    "network time protocol",
+    "time",
+    "date",
+    "sync",
+    "client",
+    "server"
+  ],
+  "author": "wraithdeveloper",
+  "license": "MIT",
+  "description": "A robust Network Time Protocol (NTP) client implementation for Node.js applications.",
   "devDependencies": {
     "@changesets/cli": "^2.27.8",
     "@types/node": "^22.5.5",
