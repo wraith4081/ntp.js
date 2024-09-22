@@ -1,5 +1,11 @@
 # ntp.js
 
+## 1.1.2
+
+### Patch Changes
+
+- 71ca965: Try to fix publish script
+
 ## 1.1.1
 
 ### Patch Changes
