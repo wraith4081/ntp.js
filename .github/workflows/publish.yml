@@ -34,13 +34,17 @@ jobs:
                   registry-url: 'https://registry.npmjs.org'
 
             - run: pnpm install --frozen-lockfile
+            - run: pnpm run build
             - name: 'authenticate with GH package registry'
               run: echo "//registry.npmjs.org/:_authToken=${{ secrets.NPM_TOKEN }}" > ~/.npmrc
             - name: Create Release Pull Request or Publish
               id: changesets
               uses: changesets/action@v1
               with:
-                  publish: pnpm release
+                  version: pnpm run version
+                  publish: pnpm exec changeset publish
+                  commit: "[ci] release"
+                  title: "[ci] release"
               env:
                   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
                   NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
