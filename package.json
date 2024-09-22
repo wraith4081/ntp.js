@@ -1,6 +1,6 @@
 {
   "name": "ntp.js",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "engines": {
     "node": ">=16.0.0"
   },
@@ -34,24 +34,24 @@
     "tsup": "^8.3.0",
     "typescript": "^5.6.2"
   },
-	"bugs": {
-		"url": "https://github.com/wraith4081/ntp.js/issues"
-	},
-	"homepage": "https://github.com/wraith4081/ntp.js",
-	"repository": {
-		"type": "git",
-		"url": "https://github.com/wraith4081/ntp.js.git"
-	},
-	"contributors": [
-		{
-			"name": "wraith4081",
-			"url": "https://github.com/wraith4081"
-		},
-		{
-			"name": "BarisYilmaz",
-			"url": "https://github.com/BarisYilmaz"
-		}
-	],
+  "bugs": {
+    "url": "https://github.com/wraith4081/ntp.js/issues"
+  },
+  "homepage": "https://github.com/wraith4081/ntp.js",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/wraith4081/ntp.js.git"
+  },
+  "contributors": [
+    {
+      "name": "wraith4081",
+      "url": "https://github.com/wraith4081"
+    },
+    {
+      "name": "BarisYilmaz",
+      "url": "https://github.com/BarisYilmaz"
+    }
+  ],
   "maintainers": [
     {
       "name": "wraith4081",
