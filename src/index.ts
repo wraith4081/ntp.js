@@ -1,4 +1,5 @@
 import dgram from 'dgram';
+import dns from 'dns';
 import { EventEmitter } from 'events';
 import { performance } from 'perf_hooks';
 
@@ -14,6 +15,7 @@ interface NTPClientOptions {
   timeOffset?: number;
   updateInterval?: number;
   maxRetries?: number;
+  protocol?: 'udp4' | 'udp6';
 }
 
 enum NTP_EVENTS {
@@ -33,7 +35,7 @@ interface NTPClientEvents {
 }
 
 class NTPClient extends EventEmitter {
-  private readonly udp: dgram.Socket;
+  private udp: dgram.Socket;
   private udpSetup: boolean = false;
   private readonly poolServerName: string;
   private readonly port: number;
@@ -51,10 +53,23 @@ class NTPClient extends EventEmitter {
   private skewIntercept: number = 0;
   private pendingRequests: Map<string, { highRes: number; unix: number; timeoutId: NodeJS.Timeout }> = new Map();
   private syncStatus: SyncStatus = 'syncing';
+  private currentProtocol: 'udp4' | 'udp6' = 'udp4';
 
   constructor(options: NTPClientOptions = {}) {
     super();
-    this.udp = dgram.createSocket('udp4');
+
+    if (options.port !== undefined && (options.port < 1 || options.port > 65535)) {
+      throw new Error('Port must be between 1 and 65535');
+    }
+    if (options.updateInterval !== undefined && options.updateInterval <= 0) {
+      throw new Error('Update interval must be greater than 0');
+    }
+    if (options.maxRetries !== undefined && options.maxRetries < 0) {
+      throw new Error('Max retries must be non-negative');
+    }
+
+    this.currentProtocol = options.protocol || 'udp4';
+    this.udp = dgram.createSocket(this.currentProtocol);
     this.poolServerName = options.poolServerName || "pool.ntp.org";
     this.port = options.port || NTP_DEFAULT_PORT;
     this.timeOffset = options.timeOffset || 0;
@@ -65,6 +80,9 @@ class NTPClient extends EventEmitter {
   }
 
   private setupUDPListeners(): void {
+    this.udp.removeAllListeners('error');
+    this.udp.removeAllListeners('message');
+
     this.udp.on('error', (err: Error) => {
       this.handleError('UDP error', err);
     });
@@ -120,62 +138,92 @@ class NTPClient extends EventEmitter {
     }
   }
 
-  public forceUpdate(): void {
+  public async forceUpdate(): Promise<void> {
     this.setSyncStatus(NTP_EVENTS.SYNCING);
-    this.sendNTPPacket();
+    await this.sendNTPPacket();
     this.lastSyncTime = Date.now();
-    // Reset retry count for the new update cycle 
+    // Reset retry count for the new update cycle
     this.retryCount = 0;
   }
 
-  private sendNTPPacket(): void {
-    const packetBuffer = Buffer.alloc(NTP_PACKET_SIZE);
-    packetBuffer[0] = 0b11100011;   // LI, Version, Mode
-    packetBuffer[1] = 0;     // Stratum, or type of clock
-    packetBuffer[2] = 6;     // Polling Interval
-    packetBuffer[3] = 0xEC;  // Peer Clock Precision
-    // 8 bytes of zero for Root Delay & Root Dispersion
-    packetBuffer[12] = 49;
-    packetBuffer[13] = 0x4E;
-    packetBuffer[14] = 49;
-    packetBuffer[15] = 52;
-
-    const nowUnix = Date.now();
-    const nowHighRes = performance.now();
-
-    const ntpSec = Math.floor(nowUnix / 1000 + SEVENTY_YEARS_IN_SECONDS);
-    const baseNtpFrac = Math.floor(((nowUnix % 1000) / 1000) * 0x100000000);
-
-    // Add 16-bit random fuzz to fraction to prevent ID collisions on same-millisecond packets
-    const randomFuzz = Math.floor(Math.random() * 0xFFFF);
-    const uniqueNtpFrac = (baseNtpFrac + randomFuzz) >>> 0; // Ensure unsigned 32-bit
-
-    // Use Transmit Timestamp as unique ID for request matching
-    const packetID = `${ntpSec}:${uniqueNtpFrac}`;
-
-    // Set timeout for this specific packet
-    const timeoutId = setTimeout(() => {
-      this.handleReqTimeout(packetID);
-    }, 3000); // 3 seconds timeout
-
-    this.pendingRequests.set(packetID, { highRes: nowHighRes, unix: nowUnix, timeoutId });
-
-    packetBuffer.writeUInt32BE(ntpSec, 40);
-    packetBuffer.writeUInt32BE(uniqueNtpFrac, 44);
-
-    this.udp.send(packetBuffer, 0, packetBuffer.length, this.port, this.poolServerName, (err) => {
-      if (err) {
-        // If send fails immediately, clear the timeout and handle error
-        const pending = this.pendingRequests.get(packetID);
-        if (pending) {
-          clearTimeout(pending.timeoutId);
-          this.pendingRequests.delete(packetID);
+  private async dnsLookup(hostname: string): Promise<{ address: string; family: number }> {
+    return new Promise((resolve, reject) => {
+      dns.lookup(hostname, { all: false }, (err, address, family) => {
+        if (err) {
+          reject(err);
+        } else {
+          resolve({ address, family });
         }
-        this.handleError('Error sending NTP packet', err);
-        // We could retry here effectively the same as a timeout
-        this.handleSendError();
-      }
+      });
     });
+  }
+
+  private async sendNTPPacket(): Promise<void> {
+    try {
+      const { address, family } = await this.dnsLookup(this.poolServerName);
+      const requiredProtocol = family === 6 ? 'udp6' : 'udp4';
+
+      if (this.currentProtocol !== requiredProtocol) {
+        // Switch socket to match resolved address family
+        this.udp.close();
+        this.udp = dgram.createSocket(requiredProtocol);
+        this.currentProtocol = requiredProtocol;
+        this.setupUDPListeners();
+        // Bind to allow receiving responses (though often implicit with send)
+        this.udp.bind(0);
+      }
+
+      const packetBuffer = Buffer.alloc(NTP_PACKET_SIZE);
+      packetBuffer[0] = 0b11100011;   // LI, Version, Mode
+      packetBuffer[1] = 0;     // Stratum, or type of clock
+      packetBuffer[2] = 6;     // Polling Interval
+      packetBuffer[3] = 0xEC;  // Peer Clock Precision
+      // 8 bytes of zero for Root Delay & Root Dispersion
+      packetBuffer[12] = 49;
+      packetBuffer[13] = 0x4E;
+      packetBuffer[14] = 49;
+      packetBuffer[15] = 52;
+
+      const nowUnix = Date.now();
+      const nowHighRes = performance.now();
+
+      const ntpSec = Math.floor(nowUnix / 1000 + SEVENTY_YEARS_IN_SECONDS);
+      const baseNtpFrac = Math.floor(((nowUnix % 1000) / 1000) * 0x100000000);
+
+      // Add 16-bit random fuzz to fraction to prevent ID collisions on same-millisecond packets
+      const randomFuzz = Math.floor(Math.random() * 0xFFFF);
+      const uniqueNtpFrac = (baseNtpFrac + randomFuzz) >>> 0; // Ensure unsigned 32-bit
+
+      // Use Transmit Timestamp as unique ID for request matching
+      const packetID = `${ntpSec}:${uniqueNtpFrac}`;
+
+      // Set timeout for this specific packet
+      const timeoutId = setTimeout(() => {
+        this.handleReqTimeout(packetID);
+      }, 3000); // 3 seconds timeout
+
+      this.pendingRequests.set(packetID, { highRes: nowHighRes, unix: nowUnix, timeoutId });
+
+      packetBuffer.writeUInt32BE(ntpSec, 40);
+      packetBuffer.writeUInt32BE(uniqueNtpFrac, 44);
+
+      this.udp.send(packetBuffer, 0, packetBuffer.length, this.port, address, (err) => {
+        if (err) {
+          // If send fails immediately, clear the timeout and handle error
+          const pending = this.pendingRequests.get(packetID);
+          if (pending) {
+            clearTimeout(pending.timeoutId);
+            this.pendingRequests.delete(packetID);
+          }
+          this.handleError('Error sending NTP packet', err);
+          // We could retry here effectively the same as a timeout
+          this.handleSendError();
+        }
+      });
+    } catch (err: any) {
+      this.handleError('DNS Lookup failed', err);
+      this.handleSendError();
+    }
   }
 
   private handleReqTimeout(packetID: string): void {
@@ -340,6 +388,7 @@ class NTPClient extends EventEmitter {
   }
 
   private handleError(message: string, error: Error): void {
+    error.message = `${message}: ${error.message}`;
     this.emit(NTP_EVENTS.ERROR, error);
   }
 
