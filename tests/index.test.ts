@@ -1,7 +1,9 @@
 import NTPClient, { NTP_EVENTS } from '../src/index';
 import dgram from 'dgram';
+import dns from 'dns';
 
 jest.mock('dgram');
+jest.mock('dns');
 
 // Mock perf_hooks
 jest.mock('perf_hooks', () => ({
@@ -25,8 +27,12 @@ describe('NTPClient', () => {
 			bind: jest.fn(),
 			send: jest.fn(),
 			close: jest.fn(),
+			removeAllListeners: jest.fn(),
 		};
 		(dgram.createSocket as jest.Mock).mockReturnValue(mockSocket);
+		(dns.lookup as unknown as jest.Mock).mockImplementation((hostname, options, cb) => {
+			cb(null, '1.2.3.4', 4);
+		});
 
 		// Reset mock return value
 		mockPerformanceNow.mockReset();
@@ -47,7 +53,21 @@ describe('NTPClient', () => {
 		expect(ntpClient['maxRetries']).toBe(3);
 	});
 
-	test('forceUpdate() sends NTP packet with local T1 storage (including fraction)', () => {
+	test('constructor throws error for invalid port', () => {
+		expect(() => new NTPClient({ port: 0 })).toThrow('Port must be between 1 and 65535');
+		expect(() => new NTPClient({ port: 70000 })).toThrow('Port must be between 1 and 65535');
+	});
+
+	test('constructor throws error for invalid updateInterval', () => {
+		expect(() => new NTPClient({ updateInterval: 0 })).toThrow('Update interval must be greater than 0');
+		expect(() => new NTPClient({ updateInterval: -100 })).toThrow('Update interval must be greater than 0');
+	});
+
+	test('constructor throws error for invalid maxRetries', () => {
+		expect(() => new NTPClient({ maxRetries: -1 })).toThrow('Max retries must be non-negative');
+	});
+
+	test('forceUpdate() sends NTP packet with local T1 storage (including fraction)', async () => {
 		const now = 1000;
 		const nowHighRes = 100.5;
 		jest.spyOn(Date, 'now').mockReturnValue(now);
@@ -55,7 +75,7 @@ describe('NTPClient', () => {
 		// Mock Math.random to return 0 for deterministic ID
 		jest.spyOn(Math, 'random').mockReturnValue(0);
 
-		ntpClient.forceUpdate();
+		await ntpClient.forceUpdate();
 
 		// Calculate expected ID
 		const ntpSec = Math.floor(now / 1000 + 2208988800);
@@ -322,11 +342,12 @@ describe('NTPClient', () => {
 		expect(ntpClient['pendingRequests'].has(packetID)).toBe(true);
 	});
 
-	test('sendNTPPacket() sets timeout and retries on failure', () => {
+	test('sendNTPPacket() sets timeout and retries on failure', async () => {
 		jest.spyOn(Math, 'random').mockReturnValue(0);
-		jest.useFakeTimers();
+		// jest.useFakeTimers() is already called in beforeEach
 
-		ntpClient['sendNTPPacket']();
+		await ntpClient['sendNTPPacket']();
+
 		expect(ntpClient['pendingRequests'].size).toBe(1);
 		expect(mockSocket.send).toHaveBeenCalledTimes(1);
 
@@ -345,12 +366,21 @@ describe('NTPClient', () => {
 		// Fast forward retry delay (1000ms)
 		jest.advanceTimersByTime(1001);
 
-		// Should have sent again
+		// Flush promise microtasks
+		for (let i = 0; i < 10; i++) {
+			await Promise.resolve();
+		}
+
+		// Force resolution of macro-tasks (setTimeout) if needed.
+		// Since we can't await inside the setTimeout callback easily, we check if it called sendNTPPacket.
+		// Actually, sendNTPPacket is async, but setTimeout calls it without await.
+		// So it should trigger the call.
+
 		expect(mockSocket.send).toHaveBeenCalledTimes(2);
 		expect(ntpClient['pendingRequests'].size).toBe(1);
 	});
 
-	test('burstSync() sends multiple packets on begin', () => {
+	test('burstSync() sends multiple packets on begin', async () => {
 		jest.useFakeTimers();
 
 		// Mock bind to execute callback immediately
@@ -362,22 +392,93 @@ describe('NTPClient', () => {
 		ntpClient.begin(); // Triggers burstSync
 
 		// Initialization sends first packet immediately
+		// await resolved promise to let async flow happen
+		await Promise.resolve();
 		expect(forceUpdateSpy).toHaveBeenCalledTimes(1);
 
 		// Forward 2000ms
 		jest.advanceTimersByTime(2000);
+		await Promise.resolve();
 		expect(forceUpdateSpy).toHaveBeenCalledTimes(2);
 
 		// Forward 2000ms
 		jest.advanceTimersByTime(2000);
+		await Promise.resolve();
 		expect(forceUpdateSpy).toHaveBeenCalledTimes(3);
 
 		// Forward 2000ms
 		jest.advanceTimersByTime(2000);
+		await Promise.resolve();
 		expect(forceUpdateSpy).toHaveBeenCalledTimes(4);
 
 		// Should stop after 4
 		jest.advanceTimersByTime(2000);
 		expect(forceUpdateSpy).toHaveBeenCalledTimes(4);
+	});
+
+	test('sendNTPPacket uses correct protocol and address from DNS', async () => {
+		(dns.lookup as unknown as jest.Mock).mockImplementation((hostname, options, cb) => {
+			cb(null, '2001:db8::1', 6);
+		});
+
+		await ntpClient.forceUpdate();
+
+		// Expect dgram to be recreated with udp6
+		expect(dgram.createSocket).toHaveBeenCalledWith('udp6');
+		// socket should have been replaced, so update mockSocket ref if needed but simpler to check send call
+		// send is called on this.udp. Since createSocket returned mockSocket, it is the same object mock.
+
+		expect(mockSocket.send).toHaveBeenCalled();
+		const callArgs = mockSocket.send.mock.calls[0];
+		// buffer, offset, length, port, address, cb
+		expect(callArgs[4]).toBe('2001:db8::1');
+	});
+
+	test('sendNTPPacket switches protocol if needed', async () => {
+		// Start as udp4 (default) using the setup in beforeEach
+		// 1. First call with IPv4
+		(dns.lookup as unknown as jest.Mock).mockImplementation((hostname, options, cb) => {
+			cb(null, '1.2.3.4', 4);
+		});
+
+		await ntpClient.forceUpdate();
+
+		expect(dgram.createSocket).toHaveBeenCalledWith('udp4'); // from constructor + default
+		expect(mockSocket.send).toHaveBeenCalledTimes(1);
+		expect(ntpClient['currentProtocol']).toBe('udp4');
+
+		// 2. Next call with IPv6
+		(dns.lookup as unknown as jest.Mock).mockImplementation((hostname, options, cb) => {
+			cb(null, '2001:db8::1', 6);
+		});
+
+		// Reset mockSocket to verify close is called
+		mockSocket.close.mockClear();
+		// and createSocket should be called again
+		(dgram.createSocket as jest.Mock).mockClear();
+		(dgram.createSocket as jest.Mock).mockReturnValue(mockSocket); // Return same mock for simplicity
+
+		await ntpClient.forceUpdate();
+
+		expect(mockSocket.close).toHaveBeenCalled();
+		expect(dgram.createSocket).toHaveBeenCalledWith('udp6');
+		expect(ntpClient['currentProtocol']).toBe('udp6');
+		expect(mockSocket.send).toHaveBeenCalledTimes(2);
+
+		// Check address in second call
+		expect(mockSocket.send.mock.calls[1][4]).toBe('2001:db8::1');
+	});
+
+	test('dnsLookup handles errors gracefully', async () => {
+		(dns.lookup as unknown as jest.Mock).mockImplementation((hostname, options, cb) => {
+			cb(new Error('DNS Error'), '', 0);
+		});
+
+		const errorHandler = jest.fn();
+		ntpClient.on(NTP_EVENTS.ERROR, errorHandler);
+
+		await ntpClient.forceUpdate();
+
+		expect(errorHandler).toHaveBeenCalledWith(expect.objectContaining({ message: expect.stringContaining('DNS Lookup failed') }));
 	});
 });
