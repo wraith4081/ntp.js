@@ -64,7 +64,8 @@ describe('NTPClient', () => {
 		const packetID = `${ntpSec}:${ntpFrac}`;
 
 		expect(ntpClient['pendingRequests'].size).toBe(1);
-		expect(ntpClient['pendingRequests'].get(packetID)).toEqual({ highRes: nowHighRes, unix: now });
+		expect(ntpClient['pendingRequests'].get(packetID)).toEqual(expect.objectContaining({ highRes: nowHighRes, unix: now }));
+		expect(ntpClient['pendingRequests'].get(packetID)!.timeoutId).toBeDefined();
 		expect(mockSocket.send).toHaveBeenCalled();
 
 		// Verify buffer content (seconds and fraction)
@@ -81,7 +82,7 @@ describe('NTPClient', () => {
 		const ntpFrac = Math.floor(((T1_unix % 1000) / 1000) * 0x100000000);
 		const packetID = `${ntpSec}:${ntpFrac}`;
 
-		ntpClient['pendingRequests'].set(packetID, { highRes: T1_highRes, unix: T1_unix });
+		ntpClient['pendingRequests'].set(packetID, { highRes: T1_highRes, unix: T1_unix, timeoutId: setTimeout(() => { }, 1000) });
 
 		// Mock performance.now() for receive time (T4)
 		mockPerformanceNow.mockReturnValue(1100); // 100ms local elapsed
@@ -95,6 +96,8 @@ describe('NTPClient', () => {
 
 		// Write timestamps to packet
 		// Origin T1 (Client sent time) -> Server echos this back
+		mockBuffer.writeUInt8(4, 0); // Mode 4 (Server)
+		mockBuffer.writeUInt8(2, 1); // Stratum 2
 		mockBuffer.writeUInt32BE(ntpSec, 24);
 		mockBuffer.writeUInt32BE(ntpFrac, 28);
 
@@ -127,7 +130,7 @@ describe('NTPClient', () => {
 		const ntpFrac = Math.floor(((T1_unix % 1000) / 1000) * 0x100000000);
 		const packetID = `${ntpSec}:${ntpFrac}`;
 
-		ntpClient['pendingRequests'].set(packetID, { highRes: T1_highRes, unix: T1_unix });
+		ntpClient['pendingRequests'].set(packetID, { highRes: T1_highRes, unix: T1_unix, timeoutId: setTimeout(() => { }, 1000) });
 
 		// Mock performance.now() for receive time (T4)
 		// Simulate 300ms RTT
@@ -143,6 +146,8 @@ describe('NTPClient', () => {
 		const T3 = T2 + 10;
 
 		// Write timestamps to packet
+		mockBuffer.writeUInt8(4, 0); // Mode 4
+		mockBuffer.writeUInt8(2, 1); // Stratum 2
 		mockBuffer.writeUInt32BE(ntpSec, 24);
 		mockBuffer.writeUInt32BE(ntpFrac, 28);
 
@@ -178,14 +183,16 @@ describe('NTPClient', () => {
 		const TB_highRes = 1500;
 		const idB = `${Math.floor(TB_unix / 1000 + 2208988800)}:${Math.floor(((TB_unix % 1000) / 1000) * 0x100000000)}`;
 
-		ntpClient['pendingRequests'].set(idA, { highRes: TA_highRes, unix: TA_unix });
-		ntpClient['pendingRequests'].set(idB, { highRes: TB_highRes, unix: TB_unix });
+		ntpClient['pendingRequests'].set(idA, { highRes: TA_highRes, unix: TA_unix, timeoutId: setTimeout(() => { }, 1000) });
+		ntpClient['pendingRequests'].set(idB, { highRes: TB_highRes, unix: TB_unix, timeoutId: setTimeout(() => { }, 1000) });
 
 		// Packet for A arrives LATER (at 2000)
 		mockPerformanceNow.mockReturnValue(2000);
 
 		const bufferA = Buffer.alloc(48);
 		// Write ID A into buffer (Origin Timestamp)
+		bufferA.writeUInt8(4, 0); // Mode 4
+		bufferA.writeUInt8(2, 1); // Stratum 2
 		bufferA.writeUInt32BE(Math.floor(TA_unix / 1000) + 2208988800, 24);
 		bufferA.writeUInt32BE(Math.floor(((TA_unix % 1000) / 1000) * 0x100000000), 28);
 
@@ -243,5 +250,134 @@ describe('NTPClient', () => {
 
 	test('getTime() returns 0 if not synced', () => {
 		expect(ntpClient.getTime()).toBe(0);
+	});
+
+	test('processNTPPacket() validates Mode (must be 4)', () => {
+		const T1_unix = 1600000000000;
+		const ntpSec = Math.floor(T1_unix / 1000 + 2208988800);
+		const ntpFrac = Math.floor(((T1_unix % 1000) / 1000) * 0x100000000);
+		const packetID = `${ntpSec}:${ntpFrac}`;
+		ntpClient['pendingRequests'].set(packetID, { highRes: 1000, unix: T1_unix, timeoutId: setTimeout(() => { }, 1000) });
+
+		const mockBuffer = Buffer.alloc(48);
+		mockBuffer.writeUInt8(3, 0); // Mode 3 (Client) - Invalid for response
+		mockBuffer.writeUInt8(4, 1); // Stratum 4 - Valid
+		mockBuffer.writeUInt32BE(ntpSec, 24);
+		mockBuffer.writeUInt32BE(ntpFrac, 28);
+
+		ntpClient['processNTPPacket'](mockBuffer);
+
+		// Should NOT process
+		expect(ntpClient['pendingRequests'].has(packetID)).toBe(true);
+	});
+
+	test('processNTPPacket() validates Stratum (rejects 0 and 16)', () => {
+		const T1_unix = 1600000000000;
+		const ntpSec = Math.floor(T1_unix / 1000 + 2208988800);
+		const ntpFrac = Math.floor(((T1_unix % 1000) / 1000) * 0x100000000);
+		const packetID = `${ntpSec}:${ntpFrac}`;
+		const addRequest = () => ntpClient['pendingRequests'].set(packetID, { highRes: 1000, unix: T1_unix, timeoutId: setTimeout(() => { }, 1000) });
+
+		addRequest();
+		const mockBuffer0 = Buffer.alloc(48);
+		mockBuffer0.writeUInt8(4 | (4 << 3), 0); // Mode 4
+		mockBuffer0.writeUInt8(0, 1); // Stratum 0 (KoD) - Invalid
+		mockBuffer0.writeUInt32BE(ntpSec, 24);
+		mockBuffer0.writeUInt32BE(ntpFrac, 28);
+
+		ntpClient['processNTPPacket'](mockBuffer0);
+		expect(ntpClient['pendingRequests'].has(packetID)).toBe(true); // Ignored
+
+		// Cleanup for next check
+		ntpClient['pendingRequests'].delete(packetID);
+		addRequest();
+
+		const mockBuffer16 = Buffer.alloc(48);
+		mockBuffer16.writeUInt8(4 | (4 << 3), 0); // Mode 4
+		mockBuffer16.writeUInt8(16, 1); // Stratum 16 (Unsynced) - Invalid
+		mockBuffer16.writeUInt32BE(ntpSec, 24);
+		mockBuffer16.writeUInt32BE(ntpFrac, 28);
+
+		ntpClient['processNTPPacket'](mockBuffer16);
+		expect(ntpClient['pendingRequests'].has(packetID)).toBe(true); // Ignored
+	});
+
+	test('processNTPPacket() validates Origin Timestamp', () => {
+		const T1_unix = 1600000000000;
+		const ntpSec = Math.floor(T1_unix / 1000 + 2208988800);
+		const ntpFrac = Math.floor(((T1_unix % 1000) / 1000) * 0x100000000);
+		const packetID = `${ntpSec}:${ntpFrac}`;
+		ntpClient['pendingRequests'].set(packetID, { highRes: 1000, unix: T1_unix, timeoutId: setTimeout(() => { }, 1000) });
+
+		const mockBuffer = Buffer.alloc(48);
+		mockBuffer.writeUInt8(4 | (4 << 3), 0); // Mode 4
+		mockBuffer.writeUInt8(2, 1); // Stratum 2
+		// Wrong Origin Timestamp
+		mockBuffer.writeUInt32BE(ntpSec + 1, 24);
+		mockBuffer.writeUInt32BE(ntpFrac, 28);
+
+		ntpClient['processNTPPacket'](mockBuffer);
+
+		// Should NOT process (pending request remains)
+		expect(ntpClient['pendingRequests'].has(packetID)).toBe(true);
+	});
+
+	test('sendNTPPacket() sets timeout and retries on failure', () => {
+		jest.spyOn(Math, 'random').mockReturnValue(0);
+		jest.useFakeTimers();
+
+		ntpClient['sendNTPPacket']();
+		expect(ntpClient['pendingRequests'].size).toBe(1);
+		expect(mockSocket.send).toHaveBeenCalledTimes(1);
+
+		// Fast forward exceeding timeout (3000ms)
+		jest.advanceTimersByTime(3001);
+
+		// Should have triggered retry
+		// Retry logic: handleReqTimeout -> handleSendError -> setTimeout(1000) -> sendNTPPacket
+
+		// First, handleReqTimeout removes the request
+		expect(ntpClient['pendingRequests'].size).toBe(0);
+
+		// Then it calls handleSendError which increments retryCount (was 0, now 1) and sets timeout 1000ms
+		expect(ntpClient['retryCount']).toBe(1);
+
+		// Fast forward retry delay (1000ms)
+		jest.advanceTimersByTime(1001);
+
+		// Should have sent again
+		expect(mockSocket.send).toHaveBeenCalledTimes(2);
+		expect(ntpClient['pendingRequests'].size).toBe(1);
+	});
+
+	test('burstSync() sends multiple packets on begin', () => {
+		jest.useFakeTimers();
+
+		// Mock bind to execute callback immediately
+		mockSocket.bind.mockImplementation((port: any, cb: any) => {
+			if (cb) cb();
+		});
+
+		const forceUpdateSpy = jest.spyOn(ntpClient, 'forceUpdate');
+		ntpClient.begin(); // Triggers burstSync
+
+		// Initialization sends first packet immediately
+		expect(forceUpdateSpy).toHaveBeenCalledTimes(1);
+
+		// Forward 2000ms
+		jest.advanceTimersByTime(2000);
+		expect(forceUpdateSpy).toHaveBeenCalledTimes(2);
+
+		// Forward 2000ms
+		jest.advanceTimersByTime(2000);
+		expect(forceUpdateSpy).toHaveBeenCalledTimes(3);
+
+		// Forward 2000ms
+		jest.advanceTimersByTime(2000);
+		expect(forceUpdateSpy).toHaveBeenCalledTimes(4);
+
+		// Should stop after 4
+		jest.advanceTimersByTime(2000);
+		expect(forceUpdateSpy).toHaveBeenCalledTimes(4);
 	});
 });
