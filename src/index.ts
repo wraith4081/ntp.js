@@ -42,9 +42,7 @@ class NTPClient extends EventEmitter {
   private timeOffset: number;
   private updateInterval: number;
   private syncedTime: number = 0;
-  private lastSyncTime: number = 0;
   private roundTripDelay: number = 0;
-  private localClockOffset: number = 0;
   private interval: NodeJS.Timeout | null = null;
   private retryCount: number = 0;
   public readonly maxRetries: number;
@@ -141,7 +139,6 @@ class NTPClient extends EventEmitter {
   public async forceUpdate(): Promise<void> {
     this.setSyncStatus(NTP_EVENTS.SYNCING);
     await this.sendNTPPacket();
-    this.lastSyncTime = Date.now();
     // Reset retry count for the new update cycle
     this.retryCount = 0;
   }
@@ -302,7 +299,6 @@ class NTPClient extends EventEmitter {
     }
 
     this.syncedTime = this.getTime(); // Current estimate
-    this.lastSyncTime = Date.now(); // Keep for legacy/UI
     this.retryCount = 0; // Reset retry count triggers on valid sync
     this.setSyncStatus('synced');
     this.emit(NTP_EVENTS.SYNC, this.syncedTime);
