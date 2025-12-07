@@ -1,5 +1,6 @@
 import dgram from 'dgram';
 import { EventEmitter } from 'events';
+import { performance } from 'perf_hooks';
 
 const SEVENTY_YEARS_IN_SECONDS = 2208988800;
 const NTP_PACKET_SIZE = 48;
@@ -45,6 +46,10 @@ class NTPClient extends EventEmitter {
   private interval: NodeJS.Timeout | null = null;
   private retryCount: number = 0;
   public readonly maxRetries: number;
+  private timeHistory: Array<{ localHighRes: number; realTime: number }> = [];
+  private skewSlope: number = 1;
+  private skewIntercept: number = 0;
+  private pendingRequests: Map<string, { highRes: number; unix: number }> = new Map();
   private syncStatus: SyncStatus = 'syncing';
 
   constructor(options: NTPClientOptions = {}) {
@@ -114,7 +119,31 @@ class NTPClient extends EventEmitter {
     packetBuffer[13] = 0x4E;
     packetBuffer[14] = 49;
     packetBuffer[15] = 52;
-    packetBuffer.writeUInt32BE(Math.floor(Date.now() / 1000 + SEVENTY_YEARS_IN_SECONDS), 40);
+
+    const nowUnix = Date.now();
+    const nowHighRes = performance.now();
+
+    const ntpSec = Math.floor(nowUnix / 1000 + SEVENTY_YEARS_IN_SECONDS);
+    const baseNtpFrac = Math.floor(((nowUnix % 1000) / 1000) * 0x100000000);
+
+    // Add 16-bit random fuzz to fraction to prevent ID collisions on same-millisecond packets
+    const randomFuzz = Math.floor(Math.random() * 0xFFFF);
+    const uniqueNtpFrac = (baseNtpFrac + randomFuzz) >>> 0; // Ensure unsigned 32-bit
+
+    // Use Transmit Timestamp as unique ID for request matching
+    const packetID = `${ntpSec}:${uniqueNtpFrac}`;
+
+    this.pendingRequests.set(packetID, { highRes: nowHighRes, unix: nowUnix });
+
+    // Clean up if not received after 5 seconds to prevent leaks
+    setTimeout(() => {
+      if (this.pendingRequests.has(packetID)) {
+        this.pendingRequests.delete(packetID);
+      }
+    }, 5000);
+
+    packetBuffer.writeUInt32BE(ntpSec, 40);
+    packetBuffer.writeUInt32BE(uniqueNtpFrac, 44);
 
     this.udp.send(packetBuffer, 0, packetBuffer.length, this.port, this.poolServerName, (err) => {
       if (err) {
@@ -134,24 +163,88 @@ class NTPClient extends EventEmitter {
   }
 
   private processNTPPacket(msg: Buffer): void {
-    const receiveTimestamp = Date.now();
+    const receiveHighRes = performance.now();
 
-    const originateTimestamp = NTPClient.ntpToMilliseconds(msg.readUInt32BE(24), msg.readUInt32BE(28));
+    // Origin Timestamp (T1) in response must match Transmit Timestamp (T3) of request
+    const originSeconds = msg.readUInt32BE(24);
+    const originFraction = msg.readUInt32BE(28);
+    const packetID = `${originSeconds}:${originFraction}`;
+
+    const pending = this.pendingRequests.get(packetID);
+    if (!pending) return; // Unmatched or timed out
+
+    // Remove from pending
+    this.pendingRequests.delete(packetID);
+
+    const originateTimestamp = NTPClient.ntpToMilliseconds(originSeconds, originFraction);
     const receiveServerTimestamp = NTPClient.ntpToMilliseconds(msg.readUInt32BE(32), msg.readUInt32BE(36));
     const transmitServerTimestamp = NTPClient.ntpToMilliseconds(msg.readUInt32BE(40), msg.readUInt32BE(44));
 
-    const T1 = originateTimestamp;
+    // Standard NTP calculations
+
+    const t1_p = pending.highRes;
+    const t4_p = receiveHighRes;
     const T2 = receiveServerTimestamp;
     const T3 = transmitServerTimestamp;
-    const T4 = receiveTimestamp;
 
-    this.roundTripDelay = (T4 - T1) - (T3 - T2);
-    this.localClockOffset = ((T2 - T1) + (T3 - T4)) / 2;
+    // Calculate local delay and server processing time
+    const localElapsed = t4_p - t1_p;
+    const serverProcessing = T3 - T2;
+    this.roundTripDelay = Math.max(0, localElapsed - serverProcessing);
 
-    this.syncedTime = receiveTimestamp + this.localClockOffset;
-    this.lastSyncTime = receiveTimestamp;
+    // Estimate real time at T4: T3 + One-way Delay (approx RTT/2)
+    const realTimeAtT4 = T3 + (this.roundTripDelay / 2);
+
+    const isOutlier = this.roundTripDelay > 250;
+
+    if (!isOutlier) {
+      this.addTimeSample(t4_p, realTimeAtT4);
+      this.recalculateSkew();
+    }
+
+    this.syncedTime = this.getTime(); // Current estimate
+    this.lastSyncTime = Date.now(); // Keep for legacy/UI
     this.setSyncStatus('synced');
-    this.emit(NTP_EVENTS.SYNC, this.getTime());
+    this.emit(NTP_EVENTS.SYNC, this.syncedTime);
+  }
+
+  private addTimeSample(localHighRes: number, realTime: number): void {
+    this.timeHistory.push({ localHighRes, realTime });
+    if (this.timeHistory.length > 20) {
+      this.timeHistory.shift(); // Keep last 20 samples
+    }
+  }
+
+  private recalculateSkew(): void {
+    if (this.timeHistory.length < 2) {
+      // Not enough data for regression, just use latest offset
+      const latest = this.timeHistory[this.timeHistory.length - 1]!;
+      this.skewSlope = 1;
+      this.skewIntercept = latest.realTime - latest.localHighRes;
+      return;
+    }
+
+    // Linear Regression: realTime = m * localHighRes + c
+    let sumX = 0, sumY = 0, sumXY = 0, sumX2 = 0;
+    const n = this.timeHistory.length;
+
+    for (const sample of this.timeHistory) {
+      sumX += sample.localHighRes;
+      sumY += sample.realTime;
+      sumXY += sample.localHighRes * sample.realTime;
+      sumX2 += sample.localHighRes * sample.localHighRes;
+    }
+
+    const denominator = n * sumX2 - sumX * sumX;
+    if (denominator === 0) {
+      this.skewSlope = 1;
+      const latest = this.timeHistory[n - 1]!;
+      this.skewIntercept = latest.realTime - latest.localHighRes;
+      return;
+    }
+
+    this.skewSlope = (n * sumXY - sumX * sumY) / denominator;
+    this.skewIntercept = (sumY - this.skewSlope * sumX) / n;
   }
 
   public static ntpToMilliseconds(seconds: number, fraction: number): number {
@@ -159,10 +252,11 @@ class NTPClient extends EventEmitter {
   }
 
   public getTime(): number {
-    if (this.syncStatus !== NTP_EVENTS.SYNCED) {
+    if (this.syncStatus !== NTP_EVENTS.SYNCED && this.timeHistory.length === 0) {
       return 0; // Time not synced yet
     }
-    return this.syncedTime + (Date.now() - this.lastSyncTime);
+    // realTime = skewSlope * currentHighRes + skewIntercept + userOffset
+    return (this.skewSlope * performance.now()) + this.skewIntercept + this.timeOffset;
   }
 
   public getSyncStatus(): SyncStatus {
@@ -172,7 +266,7 @@ class NTPClient extends EventEmitter {
   public setTimeOffset(offset: number): void {
     this.timeOffset = offset;
     if (this.syncStatus === NTP_EVENTS.SYNCED) {
-      this.syncedTime += offset;
+      // Offset is applied in getTime() automatically
     }
   }
 
