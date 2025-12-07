@@ -126,6 +126,7 @@ new NTPClient(options?: NTPClientOptions)
 | `updateInterval` | `number` | `60000` | Time between sync attempts in ms (must be > 0) |
 | `maxRetries` | `number` | `3` | Maximum retry attempts per sync cycle (must be ≥ 0) |
 | `protocol` | `'udp4' \| 'udp6'` | `'udp4'` | UDP protocol preference (auto-switches based on DNS) |
+| `rttThreshold` | `number` | `250` | RTT threshold in ms for outlier filtering (must be > 0) |
 
 ### Methods
 

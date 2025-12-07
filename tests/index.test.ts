@@ -24,7 +24,7 @@ describe('NTPClient', () => {
 		jest.useFakeTimers();
 		mockSocket = {
 			on: jest.fn(),
-			bind: jest.fn(),
+			bind: jest.fn((port: number, cb?: () => void) => { if (cb) cb(); }),
 			send: jest.fn(),
 			close: jest.fn(),
 			removeAllListeners: jest.fn(),
@@ -51,6 +51,7 @@ describe('NTPClient', () => {
 		expect(ntpClient['timeOffset']).toBe(0);
 		expect(ntpClient['updateInterval']).toBe(60000);
 		expect(ntpClient['maxRetries']).toBe(3);
+		expect(ntpClient['rttThreshold']).toBe(250);
 	});
 
 	test('constructor throws error for invalid port', () => {
@@ -65,6 +66,16 @@ describe('NTPClient', () => {
 
 	test('constructor throws error for invalid maxRetries', () => {
 		expect(() => new NTPClient({ maxRetries: -1 })).toThrow('Max retries must be non-negative');
+	});
+
+	test('constructor throws error for invalid rttThreshold', () => {
+		expect(() => new NTPClient({ rttThreshold: 0 })).toThrow('RTT threshold must be greater than 0');
+		expect(() => new NTPClient({ rttThreshold: -100 })).toThrow('RTT threshold must be greater than 0');
+	});
+
+	test('constructor accepts custom rttThreshold', () => {
+		const client = new NTPClient({ rttThreshold: 500 });
+		expect(client['rttThreshold']).toBe(500);
 	});
 
 	test('forceUpdate() sends NTP packet with local T1 storage (including fraction)', async () => {
@@ -270,6 +281,17 @@ describe('NTPClient', () => {
 
 	test('getTime() returns 0 if not synced', () => {
 		expect(ntpClient.getTime()).toBe(0);
+	});
+
+	test('setTimeOffset() throws error for invalid values', () => {
+		expect(() => ntpClient.setTimeOffset(NaN)).toThrow('Time offset must be a finite number');
+		expect(() => ntpClient.setTimeOffset(Infinity)).toThrow('Time offset must be a finite number');
+		expect(() => ntpClient.setTimeOffset(-Infinity)).toThrow('Time offset must be a finite number');
+	});
+
+	test('setUpdateInterval() throws error for invalid values', () => {
+		expect(() => ntpClient.setUpdateInterval(0)).toThrow('Update interval must be greater than 0');
+		expect(() => ntpClient.setUpdateInterval(-100)).toThrow('Update interval must be greater than 0');
 	});
 
 	test('processNTPPacket() validates Mode (must be 4)', () => {
