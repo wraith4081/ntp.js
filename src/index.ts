@@ -300,7 +300,7 @@ class NTPClient extends EventEmitter {
 
     this.syncedTime = this.getTime(); // Current estimate
     this.retryCount = 0; // Reset retry count triggers on valid sync
-    this.setSyncStatus('synced');
+    this.setSyncStatus(NTP_EVENTS.SYNCED);
     this.emit(NTP_EVENTS.SYNC, this.syncedTime);
   }
 
@@ -361,9 +361,6 @@ class NTPClient extends EventEmitter {
 
   public setTimeOffset(offset: number): void {
     this.timeOffset = offset;
-    if (this.syncStatus === NTP_EVENTS.SYNCED) {
-      // Offset is applied in getTime() automatically
-    }
   }
 
   public setUpdateInterval(interval: number): void {
@@ -375,6 +372,10 @@ class NTPClient extends EventEmitter {
 
   public stop(): void {
     this.stopInterval();
+    for (const pending of this.pendingRequests.values()) {
+      clearTimeout(pending.timeoutId);
+    }
+    this.pendingRequests.clear();
     this.udp.close();
   }
 
