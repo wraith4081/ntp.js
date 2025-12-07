@@ -49,7 +49,7 @@ class NTPClient extends EventEmitter {
   private timeHistory: Array<{ localHighRes: number; realTime: number }> = [];
   private skewSlope: number = 1;
   private skewIntercept: number = 0;
-  private pendingRequests: Map<string, { highRes: number; unix: number }> = new Map();
+  private pendingRequests: Map<string, { highRes: number; unix: number; timeoutId: NodeJS.Timeout }> = new Map();
   private syncStatus: SyncStatus = 'syncing';
 
   constructor(options: NTPClientOptions = {}) {
@@ -78,13 +78,32 @@ class NTPClient extends EventEmitter {
     if (!this.udpSetup) {
       this.udp.bind(0, () => {
         this.udpSetup = true;
-        this.startInterval();
-        this.forceUpdate();
+        this.burstSync();
       });
     } else {
-      this.startInterval();
-      this.forceUpdate();
+      this.burstSync();
     }
+  }
+
+  // Perform initial burst synchronization for faster clock convergence
+  private burstSync(): void {
+    // We will send 4 packets with 2s interval
+    let burstCount = 0;
+    const maxBurst = 4;
+    const burstInterval = 2000;
+
+    const sendBurst = () => {
+      if (burstCount >= maxBurst) {
+        // Burst done, switch to normal interval
+        this.startInterval();
+        return;
+      }
+      this.forceUpdate();
+      burstCount++;
+      setTimeout(sendBurst, burstInterval);
+    };
+
+    sendBurst();
   }
 
   private startInterval(): void {
@@ -105,6 +124,7 @@ class NTPClient extends EventEmitter {
     this.setSyncStatus(NTP_EVENTS.SYNCING);
     this.sendNTPPacket();
     this.lastSyncTime = Date.now();
+    // Reset retry count for the new update cycle 
     this.retryCount = 0;
   }
 
@@ -133,28 +153,42 @@ class NTPClient extends EventEmitter {
     // Use Transmit Timestamp as unique ID for request matching
     const packetID = `${ntpSec}:${uniqueNtpFrac}`;
 
-    this.pendingRequests.set(packetID, { highRes: nowHighRes, unix: nowUnix });
+    // Set timeout for this specific packet
+    const timeoutId = setTimeout(() => {
+      this.handleReqTimeout(packetID);
+    }, 3000); // 3 seconds timeout
 
-    // Clean up if not received after 5 seconds to prevent leaks
-    setTimeout(() => {
-      if (this.pendingRequests.has(packetID)) {
-        this.pendingRequests.delete(packetID);
-      }
-    }, 5000);
+    this.pendingRequests.set(packetID, { highRes: nowHighRes, unix: nowUnix, timeoutId });
 
     packetBuffer.writeUInt32BE(ntpSec, 40);
     packetBuffer.writeUInt32BE(uniqueNtpFrac, 44);
 
     this.udp.send(packetBuffer, 0, packetBuffer.length, this.port, this.poolServerName, (err) => {
       if (err) {
+        // If send fails immediately, clear the timeout and handle error
+        const pending = this.pendingRequests.get(packetID);
+        if (pending) {
+          clearTimeout(pending.timeoutId);
+          this.pendingRequests.delete(packetID);
+        }
         this.handleError('Error sending NTP packet', err);
+        // We could retry here effectively the same as a timeout
         this.handleSendError();
       }
     });
   }
 
+  private handleReqTimeout(packetID: string): void {
+    if (this.pendingRequests.has(packetID)) {
+      this.pendingRequests.delete(packetID);
+      // Timeout occurred logic
+      this.handleSendError();
+    }
+  }
+
   private handleSendError(): void {
     if (++this.retryCount < this.maxRetries) {
+      // Wait a bit before retrying
       setTimeout(() => this.sendNTPPacket(), 1000);
     } else {
       this.handleError('Max retries reached. NTP sync failed.', new Error('Max retries exceeded'));
@@ -164,6 +198,19 @@ class NTPClient extends EventEmitter {
 
   private processNTPPacket(msg: Buffer): void {
     const receiveHighRes = performance.now();
+
+    const mode = msg.readUInt8(0) & 0x07;
+    const stratum = msg.readUInt8(1);
+
+    // validate Mode must be 4 (Server)
+    if (mode !== 4) {
+      return; // Ignore invalid mode
+    }
+
+    // Validate Stratum (Reject KoD or Unsynced)
+    if (stratum === 0 || stratum === 16) {
+      return;
+    }
 
     // Origin Timestamp (T1) in response must match Transmit Timestamp (T3) of request
     const originSeconds = msg.readUInt32BE(24);
@@ -175,6 +222,10 @@ class NTPClient extends EventEmitter {
 
     // Remove from pending
     this.pendingRequests.delete(packetID);
+    // Clear timeout to prevent unnecessary retry
+    if (pending.timeoutId) {
+      clearTimeout(pending.timeoutId);
+    }
 
     const originateTimestamp = NTPClient.ntpToMilliseconds(originSeconds, originFraction);
     const receiveServerTimestamp = NTPClient.ntpToMilliseconds(msg.readUInt32BE(32), msg.readUInt32BE(36));
@@ -204,6 +255,7 @@ class NTPClient extends EventEmitter {
 
     this.syncedTime = this.getTime(); // Current estimate
     this.lastSyncTime = Date.now(); // Keep for legacy/UI
+    this.retryCount = 0; // Reset retry count triggers on valid sync
     this.setSyncStatus('synced');
     this.emit(NTP_EVENTS.SYNC, this.syncedTime);
   }
